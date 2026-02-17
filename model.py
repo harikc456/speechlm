@@ -243,22 +243,6 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        """
-        Forward pass.
-        
-        Args:
-            input_values: Audio input (for Wav2Vec2-style encoders)
-            input_features: Audio input (for Whisper-style encoders)
-            attention_mask: Attention mask for audio
-            input_ids: Text token IDs for decoder
-            decoder_attention_mask: Attention mask for decoder
-            labels: Labels for language modeling loss
-            past_key_values: Cached key-values for faster generation
-            use_cache: Whether to use cache
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output hidden states
-            return_dict: Whether to return ModelOutput object
-        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # Get audio features if provided
@@ -279,26 +263,17 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
             audio_features = None
             audio_attention_mask = None
         
-        # Get text embeddings if provided
-        if input_ids is not None:
-            # Get embeddings from decoder
-            if hasattr(self.decoder, 'model'):
-                # For models like Llama, Mistral, Qwen
-                text_embeddings = self.decoder.model.embed_tokens(input_ids)
-            elif hasattr(self.decoder, 'transformer'):
-                # For models like GPT-2
-                text_embeddings = self.decoder.transformer.wte(input_ids)
-            else:
-                raise AttributeError(
-                    f"Could not find embedding layer in decoder. "
-                    f"Decoder type: {type(self.decoder)}"
-                )
-        else:
-            text_embeddings = None
+        # Robust way to get embed_tokens (works with PEFT/LoRA wrappers)
+        embed_tokens = self.decoder.get_input_embeddings()
         
-        # Combine audio and text
+        # Get text embeddings if provided
+        text_embeddings = None
+        if input_ids is not None:
+            text_embeddings = embed_tokens(input_ids)
+        
+        # Handle labels and combine audio/text
         if audio_features is not None and text_embeddings is not None:
-            # Concatenate: [audio_features | text_embeddings]
+            # Standard case: audio + text prefix
             inputs_embeds = torch.cat([audio_features, text_embeddings], dim=1)
             
             # Concatenate attention masks
@@ -313,8 +288,31 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
                 [audio_attention_mask, decoder_attention_mask],
                 dim=1
             )
+        elif audio_features is not None and input_ids is None and labels is not None:
+            # New case: audio-only prompt, use labels for teacher-forcing (continuation/transcription)
+            batch_size = audio_features.shape[0]
+            # Embed the labels (full sequence)
+            text_embeddings = embed_tokens(labels)
+            
+            # Shift for teacher-forcing: use embeds[:-1]
+            shifted_text_embeddings = text_embeddings[:, :-1, :]
+            
+            # Concat to audio
+            inputs_embeds = torch.cat([audio_features, shifted_text_embeddings], dim=1)
+            
+            # Attention mask for shifted text
+            shifted_text_mask = torch.ones(
+                (batch_size, labels.shape[1] - 1),
+                dtype=torch.long,
+                device=labels.device
+            )
+            
+            combined_attention_mask = torch.cat(
+                [audio_attention_mask, shifted_text_mask],
+                dim=1
+            )
         elif audio_features is not None:
-            # Audio only
+            # Audio only (no text or labels)
             inputs_embeds = audio_features
             combined_attention_mask = audio_attention_mask
         elif text_embeddings is not None:
@@ -326,7 +324,6 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
         
         # Prepare labels if provided
         if labels is not None and audio_features is not None:
-            # Pad labels with -100 for audio tokens (we don't compute loss on them)
             audio_seq_len = audio_features.shape[1]
             audio_labels = torch.full(
                 (labels.shape[0], audio_seq_len),
@@ -334,7 +331,13 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
                 dtype=labels.dtype,
                 device=labels.device
             )
-            labels = torch.cat([audio_labels, labels], dim=1)
+            if input_ids is None:
+                # For continuation: cat with labels[1:]
+                shifted_labels = labels[:, 1:]
+                labels = torch.cat([audio_labels, shifted_labels], dim=1)
+            else:
+                # Standard: cat with full labels
+                labels = torch.cat([audio_labels, labels], dim=1)
         
         # Forward through decoder
         decoder_outputs = self.decoder(
@@ -349,7 +352,7 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
         )
         
         return decoder_outputs
-    
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
