@@ -232,126 +232,105 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
         self,
         input_values: Optional[torch.FloatTensor] = None,
         input_features: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-        input_ids: Optional[torch.LongTensor] = None,
-        decoder_attention_mask: Optional[torch.LongTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        attention_mask: Optional[torch.LongTensor] = None,    # Audio mask
+        input_ids: Optional[torch.LongTensor] = None,        # Text prompt
+        decoder_attention_mask: Optional[torch.LongTensor] = None, # Text prompt mask
+        labels: Optional[torch.LongTensor] = None,           # Target text
+        past_key_values: Optional[Tuple] = None,
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
-        # Get audio features if provided
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        all_embeddings = []
+        all_masks = []
+        
+        # 1. HANDLE AUDIO (Modality A)
+        audio_len = 0
         if input_values is not None or input_features is not None:
             audio_features = self.get_audio_features(
                 input_values=input_values,
                 input_features=input_features,
                 attention_mask=attention_mask,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
             )
+            audio_len = audio_features.shape[1]
+            all_embeddings.append(audio_features)
             
-            audio_attention_mask = self._get_audio_attention_mask(
-                audio_features,
-                attention_mask,
-            )
-        else:
-            audio_features = None
-            audio_attention_mask = None
-        
-        # Robust way to get embed_tokens (works with PEFT/LoRA wrappers)
-        embed_tokens = self.decoder.get_input_embeddings()
-        
-        # Get text embeddings if provided
-        text_embeddings = None
+            # Audio attention mask
+            audio_mask = self._get_audio_attention_mask(audio_features, attention_mask)
+            all_masks.append(audio_mask)
+
+        # 2. HANDLE TEXT PROMPT (Modality B - Optional)
+        text_prompt_len = 0
         if input_ids is not None:
-            text_embeddings = embed_tokens(input_ids)
-        
-        # Handle labels and combine audio/text
-        if audio_features is not None and text_embeddings is not None:
-            # Standard case: audio + text prefix
-            inputs_embeds = torch.cat([audio_features, text_embeddings], dim=1)
+            text_embeddings = self.decoder.get_input_embeddings()(input_ids)
+            text_prompt_len = text_embeddings.shape[1]
+            all_embeddings.append(text_embeddings)
             
-            # Concatenate attention masks
+            # Text prompt mask (default to 1s if not provided)
             if decoder_attention_mask is None:
                 decoder_attention_mask = torch.ones(
-                    text_embeddings.shape[:2],
-                    dtype=torch.long,
-                    device=text_embeddings.device
+                    input_ids.shape, dtype=torch.long, device=input_ids.device
                 )
+            all_masks.append(decoder_attention_mask)
+
+        # 3. COMBINE INPUTS
+        # Final inputs shape: (batch, audio_len + prompt_len, hidden)
+        inputs_embeds = torch.cat(all_embeddings, dim=1)
+        combined_attention_mask = torch.cat(all_masks, dim=1)
+
+        # 4. ALIGN LABELS (Crucial for Training)
+        # The labels passed by the Trainer are just the target text tokens.
+        # We must pad them so they align with the audio + prompt prefix.
+        loss_labels = None
+        if labels is not None:
+            # Number of tokens to "ignore" (Audio + Text Prompt)
+            ignore_len = audio_len + text_prompt_len
             
-            combined_attention_mask = torch.cat(
-                [audio_attention_mask, decoder_attention_mask],
-                dim=1
-            )
-        elif audio_features is not None and input_ids is None and labels is not None:
-            # New case: audio-only prompt, use labels for teacher-forcing (continuation/transcription)
-            batch_size = audio_features.shape[0]
-            # Embed the labels (full sequence)
-            text_embeddings = embed_tokens(labels)
-            
-            # Shift for teacher-forcing: use embeds[:-1]
-            shifted_text_embeddings = text_embeddings[:, :-1, :]
-            
-            # Concat to audio
-            inputs_embeds = torch.cat([audio_features, shifted_text_embeddings], dim=1)
-            
-            # Attention mask for shifted text
-            shifted_text_mask = torch.ones(
-                (batch_size, labels.shape[1] - 1),
-                dtype=torch.long,
-                device=labels.device
-            )
-            
-            combined_attention_mask = torch.cat(
-                [audio_attention_mask, shifted_text_mask],
-                dim=1
-            )
-        elif audio_features is not None:
-            # Audio only (no text or labels)
-            inputs_embeds = audio_features
-            combined_attention_mask = audio_attention_mask
-        elif text_embeddings is not None:
-            # Text only
-            inputs_embeds = text_embeddings
-            combined_attention_mask = decoder_attention_mask
-        else:
-            raise ValueError("Must provide either audio or text inputs")
-        
-        # Prepare labels if provided
-        if labels is not None and audio_features is not None:
-            audio_seq_len = audio_features.shape[1]
-            audio_labels = torch.full(
-                (labels.shape[0], audio_seq_len),
+            # Create a prefix of -100 (cross-entropy ignore index)
+            ignore_labels = torch.full(
+                (labels.shape[0], ignore_len),
                 -100,
                 dtype=labels.dtype,
                 device=labels.device
             )
-            if input_ids is None:
-                # For continuation: cat with labels[1:]
-                shifted_labels = labels[:, 1:]
-                labels = torch.cat([audio_labels, shifted_labels], dim=1)
-            else:
-                # Standard: cat with full labels
-                labels = torch.cat([audio_labels, labels], dim=1)
-        
-        # Forward through decoder
-        decoder_outputs = self.decoder(
+            
+            # Final labels: [-100, -100, ..., 502, 1034, 2]
+            loss_labels = torch.cat([ignore_labels, labels], dim=1)
+            
+            # Also need to add the labels themselves to the input embeddings 
+            # (Teacher forcing: the model sees the correct token to predict the next)
+            label_embeddings = self.decoder.get_input_embeddings()(labels)
+            inputs_embeds = torch.cat([inputs_embeds, label_embeddings], dim=1)
+            
+            # Check if labels is a tensor before doing the comparison
+            if torch.is_tensor(labels):
+                # Fallback to 0 if pad_token_id is None
+                pad_id = self.config.decoder.pad_token_id if self.config.decoder.pad_token_id is not None else 0
+                
+                # Ensure the comparison creates a BoolTensor, then cast to Long
+                label_mask = (labels != pad_id).to(dtype=torch.long, device=labels.device)
+                combined_attention_mask = torch.cat([combined_attention_mask, label_mask], dim=1)
+            
+            # Important: LLMs shift labels internally. Since we are concatenating
+            # [Prefix] + [Labels], the last token of Prefix is used to predict the 1st token of Labels.
+            # However, because we concatenated label_embeddings to inputs_embeds, 
+            # we must strip the LAST label token from inputs_embeds to keep lengths equal.
+            inputs_embeds = inputs_embeds[:, :-1, :]
+            loss_labels = loss_labels[:, 1:]
+            combined_attention_mask = combined_attention_mask[:, :-1]
+
+        # 5. FORWARD PASS
+        return self.decoder(
             inputs_embeds=inputs_embeds,
             attention_mask=combined_attention_mask,
-            labels=labels,
+            labels=loss_labels,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            **kwargs
         )
-        
-        return decoder_outputs
 
     def prepare_inputs_for_generation(
         self,
@@ -424,4 +403,3 @@ class SpeechLMModel(PreTrainedModel, GenerationMixin):
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
         """Load pretrained model."""
         return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
-
